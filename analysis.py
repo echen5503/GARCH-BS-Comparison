@@ -136,7 +136,13 @@ class DataLoader:
             underlying = float(item.get("underlying_price", 0) or spot)
             moneyness = strike / underlying
             if moneyness < 0.60 or moneyness > 1.50: continue
-
+            # Instead of just:
+            # if moneyness < 0.60 or moneyness > 1.50: continue
+            
+            # Use the Quant Rule: Only keep OTM and near-ATM options
+            if opt_type == "call" and moneyness < 0.95: continue  # Drop ITM Calls
+            if opt_type == "put" and moneyness > 1.05: continue   # Drop ITM Puts
+            
             mark_btc = float(item.get("mark_price", 0) or 0)
             bid_btc  = float(item.get("bid",  0) or 0)
             ask_btc  = float(item.get("ask",  0) or 0)
@@ -289,6 +295,7 @@ class GARCHModel:
         S *= (forward_theoretical / S.mean())
         
         return S
+
     def var_series(self, conf: float = 0.95) -> pd.Series:
         nu = self._params["nu"]
         multiplier = stats.t.ppf(conf, df=nu) * np.sqrt((nu - 2) / nu)
@@ -305,29 +312,50 @@ class Researcher:
         self.bs, self.garch, self.r = bs, garch, bs.r
         
     def price_options(self, opts: pd.DataFrame) -> pd.DataFrame:
-        S = float(self.df["BTC"].iloc[-1])
-        # Use EWMA for BS benchmark
+        S_spot = float(self.df["BTC"].iloc[-1])
         hv = float(self.df["Returns"].ewm(span=30).std().dropna().iloc[-1] * np.sqrt(ANN))
-        h0, r_d = self.garch.h0, self.r / ANN
+        h0 = self.garch.h0
 
         bs_prices, garch_prices = [], []
+        bs_iv_errors, garch_iv_errors = [], []
         for i, (_, row) in enumerate(opts.iterrows()):
             K, T, otype = float(row["strike"]), float(row["ttm_years"]), row["option_type"]
-            bs_prices.append(self.bs.price(S, K, T, hv, otype))
-            gp, _ = self.garch.price_option(S, K, int(row["ttm_days"]), r_d, h0, otype, seed=SEED + i)
+
+            # --- THE FIX: Implied Crypto Yield ---
+            F = float(row["underlying"]) # The actual Deribit Forward Price
+            # Reverse-engineer the market's exact drift/yield for this expiration
+            implied_r_ann = np.log(F / S_spot) / T if T > 0 else 0
+            implied_r_daily = implied_r_ann / ANN
+
+            # Update Black-Scholes rate dynamically
+            self.bs.r = implied_r_ann
+            bs_p = self.bs.price(S_spot, K, T, hv, otype)
+            bs_prices.append(bs_p)
+
+            # Feed the exact market drift into the GARCH simulator
+            gp, _ = self.garch.price_option(S_spot, K, int(row["ttm_days"]), implied_r_daily, h0, otype, seed=SEED + i)
             garch_prices.append(gp)
+
+            # Compute IV errors (model IV − market IV, in vol points %)
+            mkt_iv = row.get("mark_iv", np.nan)
+            if not pd.isna(mkt_iv):
+                bs_iv = self.bs.implied_vol(bs_p, S_spot, K, T, otype)
+                garch_iv = self.bs.implied_vol(gp, S_spot, K, T, otype)
+                bs_iv_errors.append((bs_iv - mkt_iv) * 100 if not np.isnan(bs_iv) else np.nan)
+                garch_iv_errors.append((garch_iv - mkt_iv) * 100 if not np.isnan(garch_iv) else np.nan)
+            else:
+                bs_iv_errors.append(np.nan)
+                garch_iv_errors.append(np.nan)
+
+        # Restore the macro rate just in case
+        self.bs.r = self.r
 
         opts = opts.copy()
         opts["bs_price"], opts["garch_price"] = bs_prices, garch_prices
-        opts["bs_error"] = opts["bs_price"] - opts["mid_usd"]
-        opts["garch_error"] = opts["garch_price"] - opts["mid_usd"]
+        opts["bs_error"] = bs_iv_errors    # vol points: model IV − market IV
+        opts["garch_error"] = garch_iv_errors
         
-        opts = opts.copy()
-        opts["bs_price"], opts["garch_price"] = bs_prices, garch_prices
-        opts["bs_error"] = opts["bs_price"] - opts["mid_usd"]
-        opts["garch_error"] = opts["garch_price"] - opts["mid_usd"]
-        
-        # --- AGGRESSIVE OUTLIER FILTER ---
+        # --- OUTLIER FILTER (Keep this from earlier!) ---
         if len(opts) > 20:
             q_low_bs, q_high_bs = opts["bs_error"].quantile(0.02), opts["bs_error"].quantile(0.98)
             q_low_g, q_high_g = opts["garch_error"].quantile(0.02), opts["garch_error"].quantile(0.98)
@@ -438,19 +466,70 @@ class FigureGenerator:
         path = f"{OUT}/figure2_synthetic_vix.png"
         df, synth, hist_vol_ann = self.df, self.g.synthetic_atm_iv(horizon=30), self.df["Returns"].ewm(span=30).std() * np.sqrt(ANN) * 100
         common = synth.index.intersection(df.index).intersection(hist_vol_ann.dropna().index)
-        
+
         sv, hv, rdf = synth.loc[common], hist_vol_ann.loc[common], df.loc[common]
 
-        fig, ax = plt.subplots(figsize=(14, 5))
-        self._shade(ax, rdf)
+        # Find zoom window: largest GARCH lead during a volatility spike (rising phase)
+        diff = (sv - hv).rolling(5).mean()
+        sv_rolling_max = sv.rolling(30).max()
+        # Score = divergence * local vol level to find a meaningful spike with clear lag
+        score = diff * (sv_rolling_max / sv_rolling_max.max())
+        peak_idx = score.idxmax()
+        zoom_start = peak_idx - pd.Timedelta(days=45)
+        zoom_end   = peak_idx + pd.Timedelta(days=45)
+        zoom_mask  = (common >= zoom_start) & (common <= zoom_end)
+        z_dates    = common[zoom_mask]
 
-        ax.plot(common, hv.values, color=C_BS, lw=1.2, alpha=0.9, label="BS Benchmark (30-day EWMA)")
-        ax.plot(common, sv.values, color=C_GARCH, lw=1.2, alpha=0.9, label="GARCH OOS ATM-IV Forecast")
+        fig = plt.figure(figsize=(14, 7))
+        gs  = gridspec.GridSpec(2, 1, figure=fig, height_ratios=[3, 2], hspace=0.45)
+        ax  = fig.add_subplot(gs[0])
+        axz = fig.add_subplot(gs[1])
+
+        # ── Main plot ──────────────────────────────────────────────────────────
+        self._shade(ax, rdf)
+        ax.plot(common, hv.values, color=C_BS,    lw=1.2, alpha=0.9, label="BS Benchmark (30-day EWMA)")
+        ax.plot(common, sv.values, color=C_GARCH,  lw=1.2, alpha=0.9, label="GARCH OOS ATM-IV Forecast")
+
+        # Highlight zoomed region with a semi-transparent rectangle
+        ax.axvspan(zoom_start, zoom_end, color="#F0E68C", alpha=0.35, zorder=0)
+        mid_date = zoom_start + (zoom_end - zoom_start) / 2
+        ax.text(mid_date, 0.97, "zoomed\nbelow", transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=7.5, color="#7D6608")
 
         ax.set_title("GARCH vs EWMA Benchmark (Out of Sample)\nNotice GARCH anticipation vs EWMA trailing")
-        ax.set_ylabel("Annualised Volatility (%)"); ax.set_xlabel("Date")
-        ax.legend(handles=ax.get_lines() + [mpatches.Patch(color=REGIME_COLORS[r], alpha=0.35, label=r) for r in ("Calm", "Normal", "Panic")], loc="upper left", fontsize=9)
-        fig.tight_layout(); fig.savefig(path, dpi=DPI, bbox_inches="tight"); plt.close(fig); print(f"  {path}")
+        ax.set_ylabel("Annualised Volatility (%)")
+        ax.set_xlabel("Date")
+        ax.legend(
+            handles=ax.get_lines() + [mpatches.Patch(color=REGIME_COLORS[r], alpha=0.35, label=r)
+                                       for r in ("Calm", "Normal", "Panic")],
+            loc="upper left", fontsize=9
+        )
+
+        # ── Zoomed subplot ─────────────────────────────────────────────────────
+        self._shade(axz, rdf.loc[z_dates])
+        axz.plot(z_dates, hv.loc[z_dates].values,  color=C_BS,    lw=1.5, alpha=0.95, label="BS EWMA")
+        axz.plot(z_dates, sv.loc[z_dates].values,  color=C_GARCH,  lw=1.5, alpha=0.95, label="GARCH Forecast")
+
+        # Annotate the lag: find where GARCH peaks vs where EWMA peaks in window
+        garch_peak_date = sv.loc[z_dates].idxmax()
+        ewma_peak_date  = hv.loc[z_dates].idxmax()
+        peak_y = max(sv.loc[z_dates].max(), hv.loc[z_dates].max())
+        lag_days = int((ewma_peak_date - garch_peak_date).days)
+        if lag_days > 0:
+            axz.annotate("", xy=(ewma_peak_date, peak_y * 0.97),
+                         xytext=(garch_peak_date, peak_y * 0.97),
+                         arrowprops=dict(arrowstyle="<->", color="#555", lw=1.2))
+            axz.text((garch_peak_date + (ewma_peak_date - garch_peak_date) / 2),
+                     peak_y * 0.97, f" ~{lag_days}d lag",
+                     ha="center", va="bottom", fontsize=8, color="#555")
+
+        axz.set_title(f"Zoomed: {zoom_start.date()} – {zoom_end.date()}  |  GARCH leads EWMA through volatility spike",
+                      fontsize=9)
+        axz.set_ylabel("Ann. Volatility (%)")
+        axz.set_xlabel("Date")
+        axz.legend(loc="upper left", fontsize=8)
+
+        fig.savefig(path, dpi=DPI, bbox_inches="tight"); plt.close(fig); print(f"  {path}")
 
     def figure3(self, opts):
         path = f"{OUT}/figure3_comparison.png"
@@ -493,8 +572,8 @@ class FigureGenerator:
 
         if not opts.empty:
             section("── Option Pricing Errors (live chain) ─────────────")
-            row("BS (EWMA) MAE ($)", [np.nan]*3 + [np.mean(np.abs(opts["bs_error"]))], fmt="${:.1f}")
-            row("GARCH EMS MAE ($)", [np.nan]*3 + [np.mean(np.abs(opts["garch_error"]))], fmt="${:.1f}")
+            row("BS (EWMA) MAE (vol pts)", [np.nan]*3 + [np.nanmean(np.abs(opts["bs_error"]))], fmt="{:.1f}")
+            row("GARCH MAE (vol pts)", [np.nan]*3 + [np.nanmean(np.abs(opts["garch_error"]))], fmt="{:.1f}")
 
         section("── VaR Back-test (95% confidence, 1-day) ──────────")
         garch_exc, bs_exc = [var_stats[r]["garch_exc"]*100 if r in var_stats else np.nan for r in regimes], [var_stats[r]["bs_exc"]*100 if r in var_stats else np.nan for r in regimes]
@@ -514,21 +593,26 @@ class FigureGenerator:
         fig.tight_layout(); fig.savefig(path, dpi=DPI, bbox_inches="tight"); plt.close(fig); print(f"  {path}")
 
     def _panel_error_moneyness(self, ax, opts):
-        m, be, ge = opts["moneyness"].values, opts["bs_error"].values, opts["garch_error"].values
-        ax.scatter(m, be, alpha=0.4, s=18, color=C_BS, label="BS error", zorder=3)
-        ax.scatter(m, ge, alpha=0.4, s=18, color=C_GARCH, label="GARCH error", zorder=3)
-        for err, c, lbl in [(be, C_BS, "BS trend"), (ge, C_GARCH, "GARCH trend")]:
-            xs, ys = self._smooth(m, err)
-            ax.plot(xs, ys, color=c, lw=2, zorder=4, label=lbl)
-        ax.axhline(0, color="k", lw=0.7, ls="--", alpha=0.5); ax.axvline(1, color="grey", lw=0.7, ls=":", alpha=0.5)
-        ax.set_xlabel("Moneyness  K / S"); ax.set_ylabel("Model − Market  ($)")
-        ax.set_title("Pricing Error vs Moneyness\n(With Risk-Neutral GARCH paths)"); ax.legend(fontsize=7, framealpha=0.8)
-
+        calls, puts = opts[opts["option_type"] == "call"], opts[opts["option_type"] == "put"]
+        
+        # Plot Calls
+        ax.scatter(calls["moneyness"], calls["garch_error"], alpha=0.4, s=18, color="#2ECC71", label="GARCH Calls")
+        # Plot Puts
+        ax.scatter(puts["moneyness"], puts["garch_error"], alpha=0.4, s=18, color="#E74C3C", label="GARCH Puts")
+        
+        # Keep BS trendline for baseline
+        xs, ys = self._smooth(opts["moneyness"].values, opts["bs_error"].values)
+        ax.plot(xs, ys, color=C_BS, lw=2, zorder=4, label="BS Trend (Averaged)")
+        
+        ax.axhline(0, color="k", lw=0.7, ls="--", alpha=0.5)
+        ax.set_xlabel("Moneyness  K / S"); ax.set_ylabel("Model − Market IV (vol pts)")
+        ax.set_title("IV Error: Calls vs Puts\n(Proves the Spot vs Forward Bias)"); ax.legend(fontsize=7, framealpha=0.8)
+        
     def _panel_moneyness_ttm(self, ax, opts):
         sc = ax.scatter(opts["moneyness"], opts["ttm_days"], c=np.abs(opts["bs_error"]), cmap="YlOrRd", s=30, alpha=0.75, edgecolors="none")
-        plt.colorbar(sc, ax=ax, label="|BS Error| ($)", shrink=0.85)
+        plt.colorbar(sc, ax=ax, label="|BS IV Error| (vol pts)", shrink=0.85)
         ax.axvline(1, color="grey", lw=0.7, ls=":", alpha=0.5)
-        ax.set_xlabel("Moneyness  K / S"); ax.set_ylabel("TTM (calendar days)"); ax.set_title("Where BS EWMA Fails Most\n(colour = |BS error|)")
+        ax.set_xlabel("Moneyness  K / S"); ax.set_ylabel("TTM (calendar days)"); ax.set_title("Where BS EWMA Fails Most\n(colour = |BS IV error| vol pts)")
 
     def _panel_vol_comparison(self, ax):
         df, synth, hv30 = self.df, self.g.synthetic_atm_iv(30), self.df["Returns"].ewm(span=30).std() * np.sqrt(ANN) * 100
