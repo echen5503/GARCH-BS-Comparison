@@ -375,27 +375,42 @@ class Researcher:
 
     def signal_backtest(self) -> pd.DataFrame:
         df = self.df.dropna(subset=["Returns"]).copy()
-        # FIX 3: Use EWMA for the Market Maker proxy
-        ewma_vol = df["Returns"].ewm(span=30).std() * np.sqrt(ANN)
-        gv = self.garch.cond_vol_ann
         
-        common = ewma_vol.dropna().index.intersection(gv.index)
-        df, ewma_vol, gv = df.loc[common], ewma_vol.loc[common], gv.loc[common]
+        # 1. Calculate Historical Realized Volatility
+        realized_vol = df["Returns"].ewm(span=30).std() * np.sqrt(ANN)
+        
+        # 2. THE FIX: Simulate Market Implied Volatility (Variance Risk Premium)
+        # Market makers historically charge a ~20% premium over realized volatility to account for tail risk.
+        simulated_implied_vol = realized_vol * 1.20 
+        
+        # 3. Get the 30-day forward-looking GARCH forecast (convert % to decimal)
+        gv_30d = self.garch.synthetic_atm_iv(horizon=30) / 100.0
+        
+        common = simulated_implied_vol.dropna().index.intersection(gv_30d.index)
+        df = df.loc[common]
+        mkt_iv_series = simulated_implied_vol.loc[common]
+        gv_series = gv_30d.loc[common]
+        
         dates, step, records = df.index.tolist(), 30, []
 
         for i in range(0, len(dates) - step - 1, step):
             t0, t30 = dates[i], dates[min(i + step, len(dates)-1)]
             S0, S30 = float(df.loc[t0, "BTC"]), float(df.loc[t30, "BTC"])
-            mkt_iv, gv0 = float(ewma_vol.loc[t0]), float(gv.loc[t0])
+            
+            # Use the inflated implied volatility as the market's price
+            mkt_iv = float(mkt_iv_series.loc[t0])
+            gv0 = float(gv_series.loc[t0])
 
             payoff = abs(S30/S0 - 1)
             
-            # FIX 4: Add Realistic Spread to Straddle Cost
+            # Price the options realistically (they will now be more expensive)
             cost_call = self.bs.price(1.0, 1.0, step/365.0, mkt_iv, "call")
             cost_put = self.bs.price(1.0, 1.0, step/365.0, mkt_iv, "put")
             cost_pct = cost_call + cost_put + 0.015 # 1.5% fixed premium/spread paid to MM
 
-            signal = gv0 > mkt_iv * 1.05
+            # 4. STRICT SIGNAL: Only buy if GARCH forecasts vol to be >5% higher than the Implied Vol markup
+            signal = gv0 > (mkt_iv * 1.05)
+            
             pnl_garch = (payoff - cost_pct) if signal else 0.0
             pnl_naive = payoff - cost_pct
 
@@ -408,7 +423,6 @@ class Researcher:
         bt = pd.DataFrame(records).set_index("date")
         bt["cum_garch"], bt["cum_naive"] = bt["pnl_garch"].cumsum(), bt["pnl_naive"].cumsum()
         return bt
-
     def var_exceedances(self) -> dict:
         df = self.df.dropna(subset=["Returns"]).copy()
         ewma_vol = df["Returns"].ewm(span=30).std() * np.sqrt(ANN)
@@ -591,7 +605,39 @@ class FigureGenerator:
             for j, clr in enumerate(clrs): table[i, j].set_facecolor(clr); table[i, j].set_edgecolor("#CCCCCC")
 
         fig.tight_layout(); fig.savefig(path, dpi=DPI, bbox_inches="tight"); plt.close(fig); print(f"  {path}")
-
+    def figure5(self, opts):
+        if opts.empty:
+            return
+            
+        path = f"{OUT}/figure5_where_garch_fails.png"
+        fig, ax = plt.subplots(figsize=(9, 6))
+        
+        # Scatter plot colored by absolute GARCH error
+        sc = ax.scatter(
+            opts["moneyness"], 
+            opts["ttm_days"], 
+            c=np.abs(opts["garch_error"]), 
+            cmap="YlOrRd", 
+            s=45, 
+            alpha=0.85, 
+            edgecolors="none"
+        )
+        
+        cbar = plt.colorbar(sc, ax=ax, label="|GARCH IV Error| (vol pts)")
+        cbar.ax.tick_params(labelsize=9)
+        
+        # Add ATM reference line
+        ax.axvline(1, color="grey", lw=1.2, ls="--", alpha=0.6, label="At-The-Money (ATM)")
+        
+        ax.set_xlabel("Moneyness  K / S", fontsize=10)
+        ax.set_ylabel("Time to Maturity (calendar days)", fontsize=10)
+        ax.set_title("Where t-GARCH(1,1) Fails Most\n(colour = |GARCH IV error| vol pts)", fontweight="bold")
+        ax.legend(loc="upper left", fontsize=9)
+        
+        fig.tight_layout()
+        fig.savefig(path, dpi=DPI, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  {path}")
     def _panel_error_moneyness(self, ax, opts):
         calls, puts = opts[opts["option_type"] == "call"], opts[opts["option_type"] == "put"]
         
@@ -708,6 +754,7 @@ def main():
     fg = FigureGenerator(df, bs, garch, res)
     fg.figure1(); fg.figure2(); fg.figure3(opts); fg.figure4(opts)
 
+    fg.figure5(opts) # <--- Add this line
     print(f"\nDone in {time.time()-t0:.0f}s — figures in {OUT}/")
     for f in sorted(os.listdir(OUT)): 
         if f.endswith(".png"): print(f"  {f}")
