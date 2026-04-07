@@ -4,6 +4,7 @@ GARCH vs Black-Scholes — BTC-USD Single-Script Analysis (REVISED)
 =================================================================
 Produces 4 high-resolution PNG figures.
 Fixes applied: Risk-Neutral EMS, Out-of-Sample testing, EWMA benchmarks.
+Update: 30-Day Monte Carlo VaR exceedance testing.
 
 Free data:
   * yfinance      — BTC-USD prices, ^IRX
@@ -136,12 +137,10 @@ class DataLoader:
             underlying = float(item.get("underlying_price", 0) or spot)
             moneyness = strike / underlying
             if moneyness < 0.60 or moneyness > 1.50: continue
-            # Instead of just:
-            # if moneyness < 0.60 or moneyness > 1.50: continue
             
             # Use the Quant Rule: Only keep OTM and near-ATM options
-            if opt_type == "call" and moneyness < 0.95: continue  # Drop ITM Calls
-            if opt_type == "put" and moneyness > 1.05: continue   # Drop ITM Puts
+            if opt_type == "call" and moneyness < 0.95: continue  
+            if opt_type == "put" and moneyness > 1.05: continue   
             
             mark_btc = float(item.get("mark_price", 0) or 0)
             bid_btc  = float(item.get("bid",  0) or 0)
@@ -166,7 +165,6 @@ class DataLoader:
 
     def _synthetic(self, spot: float, r_annual: float, bs_model) -> pd.DataFrame:
         path = f"{CACHE}/prices.csv"
-        # FIX 3 context: using EWMA for the synthetic fallback as well
         hist_vol = float(pd.read_csv(path, index_col=0)["Returns"].ewm(span=30).std().dropna().iloc[-1] * np.sqrt(ANN)) if os.path.exists(path) else 0.65
         
         moneyness_grid = np.linspace(0.72, 1.30, 18)
@@ -213,23 +211,19 @@ class BlackScholesModel:
             return float(optimize.brentq(lambda s: self.price(S, K, T, s, option_type) - mkt_price, 1e-6, 10.0, xtol=1e-7))
         except: return np.nan
 
-    def var_series(self, hist_vol: pd.Series, conf: float = 0.95) -> pd.Series:
-        return (stats.norm.ppf(conf) * hist_vol / np.sqrt(ANN)).rename("bs_var")
+    def var_series(self, hist_vol: pd.Series, conf: float = 0.95, horizon: int = 30) -> pd.Series:
+        # Scale annualized historical volatility strictly to the horizon length
+        return (stats.norm.ppf(conf) * hist_vol * np.sqrt(horizon / ANN)).rename("bs_var")
 
 class GARCHModel:
     def __init__(self):
         self._res, self._params, self._cvar = None, None, None
 
     def fit(self, returns: pd.Series, last_obs: str = None) -> "GARCHModel":
-        """
-        Fits parameters strictly in-sample, then applies them to the full dataset 
-        to generate actual out-of-sample volatility forecasts.
-        """
         am = arch_model(returns*100, mean="Constant", vol="Garch", p=1, q=1, dist="studentst")
         res = am.fit(last_obs=last_obs, disp="off", options={"maxiter": 2000})
 
-        # --- THE FIX ---
-        # Apply the trained parameters to the full dataset to fill in the OOS volatilities
+        # Apply the trained parameters to the full dataset
         full_res = am.fix(res.params) if last_obs else res
 
         ω = res.params["omega"] / 10_000
@@ -242,7 +236,6 @@ class GARCHModel:
         self._params = dict(omega=ω, alpha=α, beta=β, persistence=ρ, nu=nu,
                             long_run_var=lrv, long_run_vol=np.sqrt(lrv*ANN) if not np.isnan(lrv) else np.nan)
         
-        # Save the full result so our OOS tracking and forecasting works
         self._res = full_res 
         self._cvar = (full_res.conditional_volatility**2) / 10_000
         self._cvar.name = "cond_var_daily"
@@ -278,17 +271,12 @@ class GARCHModel:
         S, h = np.full(n_paths, float(S0)), np.full(n_paths, float(h0))
         
         std_scale = np.sqrt((nu - 2) / nu) 
-        
-        # Dampen beta slightly to represent the Volatility Risk Premium
-        # This prevents the Student-t tails from exploding to infinity
         beta_adj = β * 0.95  
 
         for _ in range(T_days):
             z = rng.standard_t(df=nu, size=n_paths) * std_scale
             S *= np.exp(r_daily - 0.5*h + np.sqrt(h)*z)
             h = ω + α*z**2*h + beta_adj*h
-            
-            # Clamp maximum variance to prevent $60,000 options
             np.clip(h, 1e-12, 1.5, out=h)
             
         forward_theoretical = S0 * np.exp(r_daily * T_days)
@@ -296,10 +284,30 @@ class GARCHModel:
         
         return S
 
-    def var_series(self, conf: float = 0.95) -> pd.Series:
-        nu = self._params["nu"]
-        multiplier = stats.t.ppf(conf, df=nu) * np.sqrt((nu - 2) / nu)
-        return (multiplier * np.sqrt(self._cvar)).rename("garch_var")
+    def mc_var_series(self, h_series: pd.Series, T_days: int = 30, conf: float = 0.95, n_paths: int = 2000, seed: int = 42) -> pd.Series:
+        """
+        Runs a highly-vectorized 2D Monte Carlo simulation across all specified dates simultaneously 
+        to find the multi-day VaR threshold without exploding the IGARCH tails.
+        """
+        rng = np.random.default_rng(seed)
+        ω, α, β, nu = self._params["omega"], self._params["alpha"], self._params["beta"], self._params["nu"]
+        beta_adj = β * 0.95
+        std_scale = np.sqrt((nu - 2) / nu)
+        
+        N = len(h_series)
+        # Initialize (N dates, n_paths paths) matrix for vectorization
+        h = np.tile(h_series.values[:, None], (1, n_paths))
+        log_S = np.zeros((N, n_paths))
+        
+        for _ in range(T_days):
+            z = rng.standard_t(df=nu, size=(N, n_paths)) * std_scale
+            log_S += -0.5 * h + np.sqrt(h) * z
+            h = ω + α * z**2 * h + beta_adj * h
+            np.clip(h, 1e-12, 1.5, out=h)
+            
+        # 5th percentile return becomes our positive VaR limit
+        var_thresholds = -np.percentile(log_S, (1 - conf) * 100, axis=1)
+        return pd.Series(var_thresholds, index=h_series.index, name="garch_var_30d")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # RESEARCHER
@@ -307,7 +315,6 @@ class GARCHModel:
 
 class Researcher:
     def __init__(self, df, bs, garch):
-        # We limit analysis strictly to the Out-Of-Sample period
         self.df = df[OOS_DATE:].copy() 
         self.bs, self.garch, self.r = bs, garch, bs.r
         
@@ -321,22 +328,17 @@ class Researcher:
         for i, (_, row) in enumerate(opts.iterrows()):
             K, T, otype = float(row["strike"]), float(row["ttm_years"]), row["option_type"]
 
-            # --- THE FIX: Implied Crypto Yield ---
-            F = float(row["underlying"]) # The actual Deribit Forward Price
-            # Reverse-engineer the market's exact drift/yield for this expiration
+            F = float(row["underlying"]) 
             implied_r_ann = np.log(F / S_spot) / T if T > 0 else 0
             implied_r_daily = implied_r_ann / ANN
 
-            # Update Black-Scholes rate dynamically
             self.bs.r = implied_r_ann
             bs_p = self.bs.price(S_spot, K, T, hv, otype)
             bs_prices.append(bs_p)
 
-            # Feed the exact market drift into the GARCH simulator
             gp, _ = self.garch.price_option(S_spot, K, int(row["ttm_days"]), implied_r_daily, h0, otype, seed=SEED + i)
             garch_prices.append(gp)
 
-            # Compute IV errors (model IV − market IV, in vol points %)
             mkt_iv = row.get("mark_iv", np.nan)
             if not pd.isna(mkt_iv):
                 bs_iv = self.bs.implied_vol(bs_p, S_spot, K, T, otype)
@@ -347,15 +349,13 @@ class Researcher:
                 bs_iv_errors.append(np.nan)
                 garch_iv_errors.append(np.nan)
 
-        # Restore the macro rate just in case
         self.bs.r = self.r
 
         opts = opts.copy()
         opts["bs_price"], opts["garch_price"] = bs_prices, garch_prices
-        opts["bs_error"] = bs_iv_errors    # vol points: model IV − market IV
+        opts["bs_error"] = bs_iv_errors    
         opts["garch_error"] = garch_iv_errors
         
-        # --- OUTLIER FILTER (Keep this from earlier!) ---
         if len(opts) > 20:
             q_low_bs, q_high_bs = opts["bs_error"].quantile(0.02), opts["bs_error"].quantile(0.98)
             q_low_g, q_high_g = opts["garch_error"].quantile(0.02), opts["garch_error"].quantile(0.98)
@@ -376,14 +376,8 @@ class Researcher:
     def signal_backtest(self) -> pd.DataFrame:
         df = self.df.dropna(subset=["Returns"]).copy()
         
-        # 1. Calculate Historical Realized Volatility
         realized_vol = df["Returns"].ewm(span=30).std() * np.sqrt(ANN)
-        
-        # 2. THE FIX: Simulate Market Implied Volatility (Variance Risk Premium)
-        # Market makers historically charge a ~20% premium over realized volatility to account for tail risk.
         simulated_implied_vol = realized_vol * 1.20 
-        
-        # 3. Get the 30-day forward-looking GARCH forecast (convert % to decimal)
         gv_30d = self.garch.synthetic_atm_iv(horizon=30) / 100.0
         
         common = simulated_implied_vol.dropna().index.intersection(gv_30d.index)
@@ -397,18 +391,15 @@ class Researcher:
             t0, t30 = dates[i], dates[min(i + step, len(dates)-1)]
             S0, S30 = float(df.loc[t0, "BTC"]), float(df.loc[t30, "BTC"])
             
-            # Use the inflated implied volatility as the market's price
             mkt_iv = float(mkt_iv_series.loc[t0])
             gv0 = float(gv_series.loc[t0])
 
             payoff = abs(S30/S0 - 1)
             
-            # Price the options realistically (they will now be more expensive)
             cost_call = self.bs.price(1.0, 1.0, step/365.0, mkt_iv, "call")
             cost_put = self.bs.price(1.0, 1.0, step/365.0, mkt_iv, "put")
-            cost_pct = cost_call + cost_put + 0.015 # 1.5% fixed premium/spread paid to MM
+            cost_pct = cost_call + cost_put + 0.015
 
-            # 4. STRICT SIGNAL: Only buy if GARCH forecasts vol to be >5% higher than the Implied Vol markup
             signal = gv0 > (mkt_iv * 1.05)
             
             pnl_garch = (payoff - cost_pct) if signal else 0.0
@@ -423,13 +414,26 @@ class Researcher:
         bt = pd.DataFrame(records).set_index("date")
         bt["cum_garch"], bt["cum_naive"] = bt["pnl_garch"].cumsum(), bt["pnl_naive"].cumsum()
         return bt
+
     def var_exceedances(self) -> dict:
         df = self.df.dropna(subset=["Returns"]).copy()
         ewma_vol = df["Returns"].ewm(span=30).std() * np.sqrt(ANN)
-        gv_d, bs_d = self.garch.var_series(0.95), self.bs.var_series(ewma_vol, 0.95)
+        
+        # Calculate exactly exactly what the forward 30-day continuous return was
+        df["Returns_30d"] = np.log(df["BTC"].shift(-30) / df["BTC"])
+        
+        # Fetch MC-simulated GARCH VaR and Scaled BS VaR
+        h_series = self.garch.cond_var.loc[df.index]
+        gv_d = self.garch.mc_var_series(h_series, T_days=30, conf=0.95)
+        bs_d = self.bs.var_series(ewma_vol, conf=0.95, horizon=30)
 
-        common = df.index.intersection(gv_d.index).intersection(bs_d.dropna().index)
-        r, gvr, bvr, reg = df.loc[common, "Returns"], gv_d.loc[common], bs_d.loc[common], df.loc[common, "Regime"]
+        # Truncate the most recent 30 days since we don't have forward returns yet
+        common = df.dropna(subset=["Returns_30d"]).index.intersection(gv_d.index).intersection(bs_d.dropna().index)
+        
+        r = df.loc[common, "Returns_30d"]
+        gvr = gv_d.loc[common]
+        bvr = bs_d.loc[common]
+        reg = df.loc[common, "Regime"]
 
         out = {}
         for regime in ("Calm", "Normal", "Panic", "Overall"):
@@ -456,7 +460,6 @@ class FigureGenerator:
           "axes.grid": True, "grid.alpha": 0.2, "grid.linestyle": "--", "axes.titlesize": 12, "axes.labelsize": 10}
 
     def __init__(self, df, bs, garch, researcher):
-        # Default visuals to Out of Sample data
         self.df = df[OOS_DATE:] 
         self.bs, self.g, self.res = bs, garch, researcher
         plt.rcParams.update(self.RC)
@@ -483,10 +486,8 @@ class FigureGenerator:
 
         sv, hv, rdf = synth.loc[common], hist_vol_ann.loc[common], df.loc[common]
 
-        # Find zoom window: largest GARCH lead during a volatility spike (rising phase)
         diff = (sv - hv).rolling(5).mean()
         sv_rolling_max = sv.rolling(30).max()
-        # Score = divergence * local vol level to find a meaningful spike with clear lag
         score = diff * (sv_rolling_max / sv_rolling_max.max())
         peak_idx = score.idxmax()
         zoom_start = peak_idx - pd.Timedelta(days=45)
@@ -499,12 +500,10 @@ class FigureGenerator:
         ax  = fig.add_subplot(gs[0])
         axz = fig.add_subplot(gs[1])
 
-        # ── Main plot ──────────────────────────────────────────────────────────
         self._shade(ax, rdf)
         ax.plot(common, hv.values, color=C_BS,    lw=1.2, alpha=0.9, label="BS Benchmark (30-day EWMA)")
         ax.plot(common, sv.values, color=C_GARCH,  lw=1.2, alpha=0.9, label="GARCH OOS ATM-IV Forecast")
 
-        # Highlight zoomed region with a semi-transparent rectangle
         ax.axvspan(zoom_start, zoom_end, color="#F0E68C", alpha=0.35, zorder=0)
         mid_date = zoom_start + (zoom_end - zoom_start) / 2
         ax.text(mid_date, 0.97, "zoomed\nbelow", transform=ax.get_xaxis_transform(),
@@ -519,12 +518,10 @@ class FigureGenerator:
             loc="upper left", fontsize=9
         )
 
-        # ── Zoomed subplot ─────────────────────────────────────────────────────
         self._shade(axz, rdf.loc[z_dates])
         axz.plot(z_dates, hv.loc[z_dates].values,  color=C_BS,    lw=1.5, alpha=0.95, label="BS EWMA")
         axz.plot(z_dates, sv.loc[z_dates].values,  color=C_GARCH,  lw=1.5, alpha=0.95, label="GARCH Forecast")
 
-        # Annotate the lag: find where GARCH peaks vs where EWMA peaks in window
         garch_peak_date = sv.loc[z_dates].idxmax()
         ewma_peak_date  = hv.loc[z_dates].idxmax()
         peak_y = max(sv.loc[z_dates].max(), hv.loc[z_dates].max())
@@ -589,7 +586,7 @@ class FigureGenerator:
             row("BS (EWMA) MAE (vol pts)", [np.nan]*3 + [np.nanmean(np.abs(opts["bs_error"]))], fmt="{:.1f}")
             row("GARCH MAE (vol pts)", [np.nan]*3 + [np.nanmean(np.abs(opts["garch_error"]))], fmt="{:.1f}")
 
-        section("── VaR Back-test (95% confidence, 1-day) ──────────")
+        section("── VaR Back-test (95% confidence, 30-day) ──────────")
         garch_exc, bs_exc = [var_stats[r]["garch_exc"]*100 if r in var_stats else np.nan for r in regimes], [var_stats[r]["bs_exc"]*100 if r in var_stats else np.nan for r in regimes]
         exc_color = lambda v: "#FDFEFE" if np.isnan(v) else ("#ABEBC6" if abs(v-5)<1.5 else ("#FAD7A0" if abs(v-5)<4 else "#F1948A"))
         
@@ -605,6 +602,7 @@ class FigureGenerator:
             for j, clr in enumerate(clrs): table[i, j].set_facecolor(clr); table[i, j].set_edgecolor("#CCCCCC")
 
         fig.tight_layout(); fig.savefig(path, dpi=DPI, bbox_inches="tight"); plt.close(fig); print(f"  {path}")
+        
     def figure5(self, opts):
         if opts.empty:
             return
@@ -612,7 +610,6 @@ class FigureGenerator:
         path = f"{OUT}/figure5_where_garch_fails.png"
         fig, ax = plt.subplots(figsize=(9, 6))
         
-        # Scatter plot colored by absolute GARCH error
         sc = ax.scatter(
             opts["moneyness"], 
             opts["ttm_days"], 
@@ -626,7 +623,6 @@ class FigureGenerator:
         cbar = plt.colorbar(sc, ax=ax, label="|GARCH IV Error| (vol pts)")
         cbar.ax.tick_params(labelsize=9)
         
-        # Add ATM reference line
         ax.axvline(1, color="grey", lw=1.2, ls="--", alpha=0.6, label="At-The-Money (ATM)")
         
         ax.set_xlabel("Moneyness  K / S", fontsize=10)
@@ -638,15 +634,13 @@ class FigureGenerator:
         fig.savefig(path, dpi=DPI, bbox_inches="tight")
         plt.close(fig)
         print(f"  {path}")
+        
     def _panel_error_moneyness(self, ax, opts):
         calls, puts = opts[opts["option_type"] == "call"], opts[opts["option_type"] == "put"]
         
-        # Plot Calls
         ax.scatter(calls["moneyness"], calls["garch_error"], alpha=0.4, s=18, color="#2ECC71", label="GARCH Calls")
-        # Plot Puts
         ax.scatter(puts["moneyness"], puts["garch_error"], alpha=0.4, s=18, color="#E74C3C", label="GARCH Puts")
         
-        # Keep BS trendline for baseline
         xs, ys = self._smooth(opts["moneyness"].values, opts["bs_error"].values)
         ax.plot(xs, ys, color=C_BS, lw=2, zorder=4, label="BS Trend (Averaged)")
         
@@ -710,7 +704,7 @@ class FigureGenerator:
                 if h > 0: ax.text(bar.get_x()+bar.get_width()/2, h+0.1, f"{h:.1f}", ha="center", va="bottom", fontsize=7)
 
         ax.axhline(5, color="k", lw=0.7, ls="--", alpha=0.4); ax.set_xticks(x); ax.set_xticklabels(regimes, fontsize=9)
-        ax.set_ylabel("Exceedance Rate (%)"); ax.set_title("95% VaR Exceedances (OOS)\n(Regimes defined by BTC Vol)"); ax.legend(fontsize=8, framealpha=0.85)
+        ax.set_ylabel("Exceedance Rate (%)"); ax.set_title("95% VaR Exceedances (OOS 30-day)\n(Regimes defined by BTC Vol)"); ax.legend(fontsize=8, framealpha=0.85)
         ax.set_ylim(0, max(max(garch_exc), max(bs_exc), 8) * 1.3)
 
     def _shade(self, ax, df):
@@ -743,7 +737,6 @@ def main():
 
     print("\n[2/4] Fitting t-GARCH (Train/Test Split)…")
     bs, garch = BlackScholesModel(r=r_ann), GARCHModel()
-    # FIX 2: Fit model rigidly up to OOS_DATE to eliminate Look-Ahead bias.
     garch.fit(df["Returns"].dropna(), last_obs=OOS_DATE)
 
     print("\n[3/4] Options…")
@@ -754,7 +747,7 @@ def main():
     fg = FigureGenerator(df, bs, garch, res)
     fg.figure1(); fg.figure2(); fg.figure3(opts); fg.figure4(opts)
 
-    fg.figure5(opts) # <--- Add this line
+    fg.figure5(opts)
     print(f"\nDone in {time.time()-t0:.0f}s — figures in {OUT}/")
     for f in sorted(os.listdir(OUT)): 
         if f.endswith(".png"): print(f"  {f}")
